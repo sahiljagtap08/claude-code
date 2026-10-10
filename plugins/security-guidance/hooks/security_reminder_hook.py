@@ -882,7 +882,7 @@ def _agentic_review_with_race(
                 diff_files, is_diff=True, previous_findings=previous_findings
             )
         except Exception as e:  # pragma: no cover
-            g, v = None, []
+            g, v = None, None  # crashed → failed review, not a clean one
         try:
             q.put_nowait(("fallback", (g, v, {"agentic": False})))
         except _queue.Full:
@@ -897,6 +897,46 @@ def _agentic_review_with_race(
     m["race_delay_s"] = delay_s
     m["race_started"] = 1 if fallback_started.is_set() else 0
     return g, v, m
+
+
+def _failed_review_reason():
+    """Short, credential-free description of why the last review failed."""
+    code = llm._last_call_claude_http_error
+    if code is None or code == -1:
+        return "the model could not be reached"
+    return f"HTTP {code}"
+
+
+def _report_failed_review(scope, metrics):
+    """Surface a review whose model calls all failed, then exit.
+
+    Called by the commit-review and push-sweep handlers when
+    analyze_code_security returned findings=None. Emits metrics with
+    `review_failed` (plus `api_error` when an HTTP status is known), a
+    rewakeSummary that says the review did not run, and an exit-2 stderr
+    line so the model and user learn the commit was NOT reviewed — instead
+    of the misleading "no security issues found" (#99840). Callers must
+    invoke this BEFORE recording any SHA in sg-reviewed-shas so a later
+    push sweep or re-run can still review the code.
+
+    Never includes response bodies or credentials in the message.
+    """
+    reason = _failed_review_reason()
+    debug_log(f"{scope} review: could not run ({reason}); commit(s) NOT recorded as reviewed")
+    emit_metrics({
+        **metrics, "vulns_found": 0, "review_failed": True,
+        **({"api_error": llm._last_call_claude_http_error}
+           if llm._last_call_claude_http_error is not None else {}),
+    }, rewake_summary=f"{scope} security review could not run ({reason})")
+    sys.stderr.write(
+        PROVENANCE_BANNER + "\n\n"
+        f"The {scope.lower()} security review could not run ({reason}), so this "
+        "code was NOT reviewed for security issues. Tell the user that the "
+        "background security review failed and that they should check model "
+        "access (credentials, gateway, network) if they want it to run. "
+        "Do not treat the code as reviewed.\n"
+    )
+    sys.exit(2)
 
 def handle_commit_review_posttooluse(input_data):
     """PostToolUse handler for Bash — reviews git commits for security issues.
@@ -1244,6 +1284,12 @@ def handle_commit_review_posttooluse(input_data):
         concrete_guidance, vulns = analyze_code_security(
             diff_files, is_diff=True, previous_findings=previous_findings
         )
+
+    # Every model call failed → the diff was never examined. Report that and
+    # stop BEFORE recording the SHA(s) below, so the push sweep (or a re-run)
+    # still reviews them instead of treating the commit as clean.
+    if vulns is None:
+        _report_failed_review("Commit", _base)
 
     # push-sweep state: record this commit as reviewed (full 40-hex sha) so a
     # later `git push` can advance its diff base past it. Recorded here — after
@@ -1619,6 +1665,12 @@ def handle_push_sweep_posttooluse(input_data):
         agentic_metrics = {}
     review_ms = int((_time.time() - review_start) * 1000)
 
+    # Every model call failed → nothing was reviewed. Report and stop before
+    # marking the tail, so the next push still covers these commits.
+    if vulns is None:
+        _report_failed_review("Push", {**_base, "pushed": len(push_range),
+                                       "unreviewed": len(tail)})
+
     # The tail is now covered by this net-diff review.
     _append_reviewed_shas(repo_root, tail, vulns_found=len(vulns or []))
 
@@ -1946,9 +1998,34 @@ def handle_stop_hook(input_data):
         sys.stderr.write(PROVENANCE_BANNER + "\n\n" + concrete_guidance + CONTINUATION_SUFFIX + "\n")
         sys.exit(2)
 
-    if llm._last_call_claude_http_error is not None:
-        debug_log(f"Stop hook: API call failed with status {llm._last_call_claude_http_error}")
+    review_failed = vulns is None or llm._last_call_claude_http_error is not None
+    if review_failed:
+        debug_log(f"Stop hook: review could not run ({_failed_review_reason()})")
         restore_unreviewed_stop_state(session_id, touched_paths, snap_baseline)
+        # Say so once per session rather than staying silent: an expired
+        # credential or a gateway outage otherwise turns every end-of-turn
+        # review into a silent pass (#99840). Once, because Stop fires every
+        # turn and the touched-path state above is restored for a retry.
+        if atomic_check_and_mark_warning(session_id, "stop_review_failed"):
+            emit_metrics({
+                "vulns_found": 0, "review_failed": True,
+                "diff_strategy_v2": True,
+                "files_reviewed": len(diff_files),
+                "touched_paths_count": len(touched_paths),
+                "review_ms": review_ms,
+                "fire_index": fire_index,
+                **({"api_error": llm._last_call_claude_http_error}
+                   if llm._last_call_claude_http_error is not None else {}),
+            }, rewake_summary=f"Background security review could not run ({_failed_review_reason()})")
+            sys.stderr.write(
+                PROVENANCE_BANNER + "\n\n"
+                f"The background security review could not run ({_failed_review_reason()}), "
+                "so the code changed this turn was NOT reviewed for security issues. "
+                "Tell the user the review failed and that they should check model "
+                "access (credentials, gateway, network) if they want it to run. "
+                "This warning is shown once per session.\n"
+            )
+            sys.exit(2)
     else:
         debug_log("Stop hook: no security issues found")
     # CC truncates metrics to 10 keys by
@@ -1959,6 +2036,7 @@ def handle_stop_hook(input_data):
     # 6 base + optional api_error + 3 v2_metrics = ≤10.
     emit_metrics({
         "vulns_found": 0,
+        **({"review_failed": True} if review_failed else {}),
         "diff_strategy_v2": True,
         "files_reviewed": len(diff_files),
         "touched_paths_count": len(touched_paths),
