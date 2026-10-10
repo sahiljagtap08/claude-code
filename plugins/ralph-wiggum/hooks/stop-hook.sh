@@ -118,9 +118,18 @@ if [[ "$COMPLETION_PROMISE" != "null" ]] && [[ -n "$COMPLETION_PROMISE" ]]; then
   # .*? is non-greedy (takes FIRST tag), whitespace normalized
   PROMISE_TEXT=$(echo "$LAST_OUTPUT" | perl -0777 -pe 's/.*?<promise>(.*?)<\/promise>.*/$1/s; s/^\s+|\s+$//g; s/\s+/ /g' 2>/dev/null || echo "")
 
-  # Use = for literal string comparison (not pattern matching)
-  # == in [[ ]] does glob pattern matching which breaks with *, ?, [ characters
-  if [[ -n "$PROMISE_TEXT" ]] && [[ "$PROMISE_TEXT" = "$COMPLETION_PROMISE" ]]; then
+  # Normalize the EXPECTED side the same way (trim, collapse whitespace runs).
+  # setup-ralph-loop.sh stores --completion-promise verbatim, so a promise
+  # like 'ALL  DONE' (double space) or one with leading/trailing whitespace
+  # could never equal the normalized observed text and the loop could never
+  # be stopped by its own promise. The raw $COMPLETION_PROMISE is kept for
+  # the user-facing messages so they echo what the user typed.
+  COMPLETION_PROMISE_NORM=$(printf '%s' "$COMPLETION_PROMISE" | perl -0777 -pe 's/^\s+|\s+$//g; s/\s+/ /g' 2>/dev/null || printf '%s' "$COMPLETION_PROMISE")
+
+  # Literal string comparison: the right-hand operand is QUOTED, which is what
+  # disables glob matching inside [[ ]] (an unquoted *, ?, or [ on the right
+  # would be treated as a pattern). `=` and `==` behave identically here.
+  if [[ -n "$PROMISE_TEXT" ]] && [[ "$PROMISE_TEXT" = "$COMPLETION_PROMISE_NORM" ]]; then
     echo "✅ Ralph loop: Detected <promise>$COMPLETION_PROMISE</promise>"
     rm "$RALPH_STATE_FILE"
     exit 0
