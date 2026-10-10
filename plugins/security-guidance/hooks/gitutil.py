@@ -305,10 +305,13 @@ def _git_name_only(cwd, base, include_untracked=False):
     or None if git failed (unresolvable ref, not a repo, timeout). Callers
     must distinguish None (error → don't trust as a filter) from set()
     (genuinely nothing changed). `-c core.quotePath=false -z` keeps non-ASCII
-    and space-containing paths intact."""
+    and space-containing paths intact. `--ignore-submodules=dirty` skips the
+    per-submodule worktree walk, for the same reason as in
+    `_git_status_porcelain`."""
     def _run(env):
         result = subprocess.run(
-            [*GIT_CMD, "-c", "core.quotePath=false", "diff", "--name-only", "-z", base],
+            [*GIT_CMD, "-c", "core.quotePath=false", "diff", "--name-only", "-z",
+             "--ignore-submodules=dirty", base],
             cwd=cwd, capture_output=True, text=True, timeout=30,
             env=env,
         )
@@ -338,11 +341,20 @@ def _git_status_porcelain(cwd):
     -uall: list individual files inside untracked directories (default
     collapses to `dir/`). Required so the untracked set subtracts cleanly
     against the UPS-time `_list_untracked` snapshot, which uses ls-files and
-    therefore always lists individual files."""
+    therefore always lists individual files.
+
+    --ignore-submodules=dirty: don't descend into each submodule's worktree
+    looking for uncommitted edits or untracked files. Without it, git walks
+    every initialized submodule on every call, which takes over a minute in
+    repos with dozens of nested submodules (#98731) and, with the 30s
+    timeout, leaves this hook with no result at all. A submodule whose
+    checked-out commit differs from the recorded gitlink still shows as
+    modified, which is the only submodule change a superproject commit can
+    carry; the review's diff never descends into submodules anyway."""
     try:
         r = subprocess.run(
             [*GIT_CMD, "-c", "core.quotePath=false", "status",
-             "--porcelain=v1", "-uall", "-z"],
+             "--porcelain=v1", "-uall", "-z", "--ignore-submodules=dirty"],
             cwd=cwd, capture_output=True, text=True, timeout=30,
         )
         if r.returncode != 0:
