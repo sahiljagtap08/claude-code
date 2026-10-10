@@ -707,14 +707,19 @@ def _dedup_against_state(session_id: str, vulns: List[Dict[str, Any]],
     return kept, len(vulns) - len(kept)
 
 
-def analyze_code_security(files: List[Tuple[str, str]], is_diff: bool = False, previous_findings: Optional[List[str]] = None) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+def analyze_code_security(files: List[Tuple[str, str]], is_diff: bool = False, previous_findings: Optional[List[str]] = None) -> Tuple[Optional[str], Optional[List[Dict[str, Any]]]]:
     """
     Use Haiku to perform a security review of code.
     files: list of (file_path, content_or_diff) tuples
     is_diff: if True, the content is a unified diff rather than full file contents
     previous_findings: list of category strings from earlier stop hook firings this turn,
         used to prompt the reviewer to verify those issues were actually fixed.
-    Returns (formatted guidance string or None, list of vuln dicts with severity/category).
+    Returns (formatted guidance string or None, findings). `findings` is a
+    list of vuln dicts with severity/category when the review completed
+    ([] when it found nothing reportable), and None when every model call
+    failed (auth error, outage, rate limit, SDK crash). Callers must not
+    treat None as a clean review: the code was never looked at, so it must
+    not be recorded as reviewed (#99840).
     """
     if not HAS_API_CREDENTIALS or not files:
         return None, []
@@ -963,7 +968,13 @@ Respond with a JSON object. If vulnerabilities are found, set hasVulnerabilities
     analysis = _call_claude_dual_or(prompt, output_schema,
                                     bool_key="hasVulnerabilities",
                                     list_key="vulnerabilities")
-    if not analysis or not analysis.get("hasVulnerabilities") or not analysis.get("vulnerabilities"):
+    if analysis is None:
+        # Every model call failed (primary and sonnet fallback, or both
+        # dual_or legs). This is not a clean review — the diff was never
+        # examined — so report it distinctly from "no vulnerabilities".
+        debug_log("LLM code review: could not complete (all model calls failed)")
+        return None, None
+    if not analysis.get("hasVulnerabilities") or not analysis.get("vulnerabilities"):
         debug_log("LLM code review: no vulnerabilities found")
         return None, []
 
