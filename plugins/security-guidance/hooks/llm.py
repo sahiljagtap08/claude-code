@@ -200,6 +200,38 @@ def _build_auth_headers(use_token):
     else:
         headers["x-api-key"] = ANTHROPIC_API_KEY
     headers["anthropic-beta"] = ",".join(betas)
+    return _merge_custom_headers(headers)
+
+
+def _merge_custom_headers(headers):
+    """Add the headers from ANTHROPIC_CUSTOM_HEADERS to a request's headers.
+
+    Claude Code sends every header listed in ANTHROPIC_CUSTOM_HEADERS (one
+    ``Name: Value`` per line) with each API request. LLM gateways such as
+    LiteLLM rely on that for a subscription sign-in: the OAuth bearer stays
+    in ``Authorization`` and is forwarded to Anthropic, while the gateway's
+    own key travels in a custom header (``x-litellm-api-key``). The plugin's
+    direct ``urllib`` calls go to the same ANTHROPIC_BASE_URL, so without
+    these headers the gateway rejects them with 401 and every review
+    silently fails (#99857).
+
+    Headers the plugin already set for this request (auth, version, beta,
+    content type) win, compared case-insensitively, so a custom line can't
+    swap the credential the fallback logic chose. The first occurrence of a
+    custom name wins. Lines without a colon or with an empty name are
+    skipped. Values are never logged.
+    """
+    raw = os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "")
+    if not raw:
+        return headers
+    seen = {name.lower() for name in headers}
+    for line in raw.splitlines():
+        name, sep, value = line.partition(":")
+        name = name.strip()
+        if not sep or not name or name.lower() in seen:
+            continue
+        headers[name] = value.strip()
+        seen.add(name.lower())
     return headers
 
 
